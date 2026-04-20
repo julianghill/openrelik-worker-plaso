@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import shlex
 import shutil
 import subprocess
 import time
 from uuid import uuid4
-import os
+import zipfile
 
 from openrelik_worker_common.file_utils import create_output_file
 from openrelik_worker_common.task_utils import (
@@ -43,6 +44,60 @@ for plugin in parser_manager.GetNamesOfParsersWithPlugins():
 # to plaso.cli.helpers.archives
 archive_names_dict = ExtractionTool._SUPPORTED_ARCHIVE_TYPES
 archive_names = list(archive_names_dict.keys())
+
+
+def _extract_zip_file(zip_path: str, destination_dir: str) -> None:
+    """Extract a ZIP file safely into the destination directory."""
+    try:
+        with zipfile.ZipFile(zip_path) as zip_file:
+            for member in zip_file.infolist():
+                normalized_path = os.path.normpath(member.filename)
+                if (
+                    os.path.isabs(normalized_path)
+                    or normalized_path.startswith("..")
+                    or normalized_path == "."
+                ):
+                    continue
+
+                output_path = os.path.join(destination_dir, normalized_path)
+                if member.is_dir():
+                    os.makedirs(output_path, exist_ok=True)
+                    continue
+
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                with zip_file.open(member, "r") as source_file:
+                    with open(output_path, "wb") as destination_file:
+                        shutil.copyfileobj(source_file, destination_file)
+    except NotImplementedError:
+        _extract_zip_file_fallback(zip_path, destination_dir)
+
+
+def _extract_zip_file_fallback(zip_path: str, destination_dir: str) -> None:
+    """Fallback extraction for ZIP compression methods unsupported by zipfile."""
+    commands = []
+    if shutil.which("7z"):
+        commands.append(["7z", "x", "-y", f"-o{destination_dir}", zip_path])
+    if shutil.which("bsdtar"):
+        commands.append(["bsdtar", "-xf", zip_path, "-C", destination_dir])
+    if shutil.which("unzip"):
+        commands.append(["unzip", "-o", zip_path, "-d", destination_dir])
+
+    errors = []
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        errors.append(
+            f"{shlex.join(command)} (exit {result.returncode}): "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    attempted_tools = ", ".join(shlex.join(command) for command in commands) or "none"
+    error_text = "\n".join(errors) if errors else "No fallback archive tool available in container."
+    raise RuntimeError(
+        "ZIP extraction failed with unsupported compression method. "
+        f"Attempted fallback tools: {attempted_tools}\n{error_text}"
+    )
 
 # Task name used to register and route the task to the correct queue.
 TASK_NAME = "openrelik-worker-plaso.tasks.log2timeline"
@@ -149,6 +204,7 @@ def log2timeline(
                 data_type="plaso:log2timeline:plaso_storage",
             )
     status_file = create_output_file(output_path, extension="status")
+    logfile = create_output_file(output_path, extension="log")
 
     command = [
         "log2timeline.py",
@@ -162,9 +218,15 @@ def log2timeline(
         "file",
         "--status-view-file",
         status_file.path,
+        "--logfile",
+        logfile.path,
         "--storage-file",
         output_file.path,
     ]
+    has_zip_input = any(
+        (input_file.get("path") or "").lower().endswith(".zip")
+        for input_file in input_files
+    )
 
     if task_config and task_config.get("artifacts"):
         command.extend(["--artifact_filters", ",".join(task_config["artifacts"])])
@@ -174,6 +236,9 @@ def log2timeline(
 
     if task_config and task_config.get("archives"):
         command.extend(["--archives", ",".join(task_config["archives"])])
+    elif has_zip_input:
+        # Ensure ZIP collections are expanded and parsed even when no archive config is provided.
+        command.extend(["--archives", "zip"])
 
     if task_config and task_config.get("Yara rules"):
         yara_rules_file = create_output_file(
@@ -185,9 +250,20 @@ def log2timeline(
             f.write(task_config["Yara rules"])
         command.extend(["--yara_rules", yara_rules_file.path])
 
-    command_string = " ".join(command)
+    if has_zip_input:
+        # For ZIP input, unpack first and run Plaso on extracted content.
+        temp_dir = os.path.join(output_path, uuid4().hex)
+        os.mkdir(temp_dir)
 
-    if len(input_files) > 1:
+        for input_file in input_files:
+            input_path = input_file.get("path")
+            if input_path.lower().endswith(".zip"):
+                _extract_zip_file(input_path, temp_dir)
+            else:
+                filename = os.path.basename(input_path)
+                os.link(input_path, f"{temp_dir}/{filename}")
+        command.append(temp_dir)
+    elif len(input_files) > 1:
         # Create temporary directory and hard link files for processing
         temp_dir = os.path.join(output_path, uuid4().hex)
         os.mkdir(temp_dir)
@@ -216,17 +292,33 @@ def log2timeline(
     else:
         command.append(input_files[0].get("path"))
 
+    command_string = shlex.join(command)
+
     # Send initial event to indicate task has started
     self.send_event("task-progress", data={})
 
     process = subprocess.Popen(command)
     while process.poll() is None:
         if not os.path.exists(status_file.path):
+            time.sleep(1)
             continue
         with open(status_file.path, "r") as f:
             status_dict = log2timeline_status_to_dict(f.read())
             self.send_event("task-progress", data=status_dict)
         time.sleep(3)
+    return_code = process.wait()
+
+    if return_code != 0:
+        log_excerpt = ""
+        if os.path.exists(logfile.path):
+            with open(logfile.path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            log_excerpt = "".join(lines[-30:]).strip()
+        raise RuntimeError(
+            "log2timeline failed "
+            f"(exit code {return_code}). "
+            f"Log tail:\n{log_excerpt}"
+        )
 
     # TODO: File feature request in Plaso to get these methods public.
     pinfo = pinfo_tool.PinfoTool()
